@@ -61,6 +61,7 @@ public class SubsonicController : ControllerBase
     private readonly LastFmRadioStreamService _radioStreams;
     private readonly YandexPlaybackService _yandexPlayback;
     private readonly IYouTubeMusicPlaybackService _youtubeMusicPlayback;
+    private readonly YouTubeMusicPlaybackSessionStore _youtubeMusicSessions;
 
     public SubsonicController(
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
@@ -84,6 +85,7 @@ public class SubsonicController : ControllerBase
         LastFmRadioStreamService radioStreams,
         YandexPlaybackService yandexPlayback,
         IYouTubeMusicPlaybackService youtubeMusicPlayback,
+        YouTubeMusicPlaybackSessionStore youtubeMusicSessions,
         PlaylistSyncService? playlistSyncService = null,
         LastFmService? lastFmService = null,
         CoverArtService? coverArtService = null,
@@ -120,6 +122,7 @@ public class SubsonicController : ControllerBase
         _radioStreams = radioStreams;
         _yandexPlayback = yandexPlayback;
         _youtubeMusicPlayback = youtubeMusicPlayback;
+        _youtubeMusicSessions = youtubeMusicSessions;
         // No hard throw on a missing/blank Subsonic URL: that made every request
         // fail opaquely. Misconfiguration is now reported per-request with an
         // actionable message (see Ping and OctoNotConfiguredException), and the
@@ -1100,27 +1103,64 @@ public class SubsonicController : ControllerBase
             {
                 _logger.LogInformation(ex, "Could not build Yandex playback identity for {Id}; using legacy playback", id);
             }
+            TrackIdentity? playbackIdentity = null;
             if (song is not null)
             {
                 var identity = new TrackIdentity(song.Artist, song.Title, string.IsNullOrWhiteSpace(song.Album) ? null : song.Album,
                     song.Duration is > 0 and < 86400 && song.ExternalProvider is not "soulseek" ? song.Duration : null,
                     null,
                     song.ExplicitContentLyrics switch { 1 => true, 3 => false, _ => null });
-                var yandex = await _yandexPlayback.TryPrepareAsync(identity, HttpContext.RequestAborted);
-                if (yandex.IsMatched)
+                playbackIdentity = identity;
+                if (_youtubeMusicSessions.TryGetYandex(identity, out var yandexPath))
                 {
                     try
                     {
-                        var stream = System.IO.File.OpenRead(yandex.Path!);
-                        _logger.LogInformation("Yandex playback selected for {Id}", id);
-                        return File(stream, yandex.ContentType!, enableRangeProcessing: true);
+                        return File(System.IO.File.OpenRead(yandexPath), GetContentType(yandexPath), enableRangeProcessing: true);
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        _logger.LogInformation(ex, "Yandex playback file was unavailable for {Id}; using legacy playback", id);
+                        _youtubeMusicSessions.Remove(identity);
+                        return _responseBuilder.CreateError(format, 70,
+                            "Established Yandex representation is unavailable");
                     }
                 }
-                _logger.LogInformation("Yandex playback fallback for {Id}: {Status} ({Reason})", id, yandex.Status, yandex.Reason);
+
+                if (_youtubeMusicSessions.TryGetLegacy(identity))
+                {
+                    var establishedLegacy = await TryDirectStreamAsync(provider!, externalId!, id);
+                    if (establishedLegacy is not null) return establishedLegacy;
+                    _youtubeMusicSessions.Remove(identity);
+                    return _responseBuilder.CreateError(format, 70,
+                        "Established legacy representation is unavailable");
+                }
+
+                var establishedYouTube = _youtubeMusicSessions.TryGet(identity, out _, out _);
+                if (!establishedYouTube)
+                {
+                    var yandex = await _yandexPlayback.TryPrepareAsync(identity, HttpContext.RequestAborted);
+                    if (yandex.IsMatched)
+                    {
+                        try
+                        {
+                            var stream = System.IO.File.OpenRead(yandex.Path!);
+                            if (!_youtubeMusicSessions.TrySetYandex(identity, yandex.Path!))
+                            {
+                                stream.Dispose();
+                                return _responseBuilder.CreateError(format, 70,
+                                    "Another playback source was established concurrently");
+                            }
+                            _logger.LogInformation("Yandex playback selected for {Id}", id);
+                            return File(stream, yandex.ContentType!, enableRangeProcessing: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogInformation(ex, "Yandex playback file was unavailable for {Id}; using legacy playback", id);
+                        }
+                    }
+                    _logger.LogInformation("Yandex playback fallback for {Id}: {Status} ({Reason})", id, yandex.Status, yandex.Reason);
+                }
+                else
+                    _logger.LogInformation("Yandex playback skipped for {Id}: YouTube Music representation is established", id);
 
                 var youtubeMusic = await _youtubeMusicPlayback.TryOpenStreamAsync(identity,
                     Request.Headers.TryGetValue("Range", out var ytRange) ? ytRange.ToString() : null,
@@ -1134,18 +1174,30 @@ public class SubsonicController : ControllerBase
                         Response.Headers["Content-Length"] = youtubeMusic.ContentLength.Value.ToString();
                     if (!string.IsNullOrWhiteSpace(youtubeMusic.ContentRange))
                         Response.Headers["Content-Range"] = youtubeMusic.ContentRange;
-                    await using (youtubeMusic.AudioStream!)
+                    var youtubeMusicStream = youtubeMusic.AudioStream!;
+                    await using (youtubeMusicStream)
                     {
-                        await youtubeMusic.AudioStream.CopyToAsync(Response.Body, HttpContext.RequestAborted);
+                        await youtubeMusicStream.CopyToAsync(Response.Body, HttpContext.RequestAborted);
                     }
                     return new EmptyResult();
                 }
                 _logger.LogInformation("YouTube Music fallback for {Id}: {Status} ({Reason})",
                     id, youtubeMusic.Status, youtubeMusic.Reason);
+                if (youtubeMusic.ExistingRepresentation)
+                    return _responseBuilder.CreateError(format, 70, "Established YouTube Music representation is unavailable");
             }
 
+            var pinnedLegacy = playbackIdentity is not null
+                && _youtubeMusicSessions.TrySetLegacy(playbackIdentity);
+            if (playbackIdentity is not null && !pinnedLegacy)
+                return _responseBuilder.CreateError(format, 70,
+                    "Another playback source was established concurrently");
             var direct = await TryDirectStreamAsync(provider!, externalId!, id);
-            if (direct is not null) return direct;
+            if (direct is not null)
+            {
+                return direct;
+            }
+            if (pinnedLegacy) _youtubeMusicSessions.Remove(playbackIdentity!);
 
             _logger.LogWarning("Direct stream not available for {Id}", id);
             return _responseBuilder.CreateError(format, 70, "No playable source found for this track");

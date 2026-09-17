@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using YouTubeMusicAPI.Client;
 using YouTubeMusicAPI.Models.Info;
@@ -27,8 +28,124 @@ public sealed class YouTubeMusicPlaybackResult
     public int StatusCode { get; init; } = 200;
     public string? ContentRange { get; init; }
     public string? Reason { get; init; }
+    public bool ExistingRepresentation { get; init; }
 
     public bool IsMatched => Status == YouTubeMusicPlaybackStatus.Matched && AudioStream is not null;
+}
+
+public enum YouTubeMusicPlaybackSource
+{
+    YouTubeMusic,
+    Yandex,
+    Legacy,
+}
+
+public sealed record YouTubeMusicPlaybackSession(
+    YouTubeMusicPlaybackSource Source,
+    string? VideoId,
+    int? Itag,
+    DateTimeOffset ExpiresAt);
+
+/// <summary>
+/// Keeps the selected YouTube Music representation stable across range requests
+/// so a seek cannot switch to a different source or encoding.
+/// </summary>
+public sealed class YouTubeMusicPlaybackSessionStore
+{
+    private static readonly TimeSpan SessionTtl = TimeSpan.FromMinutes(15);
+    private readonly ConcurrentDictionary<string, YouTubeMusicPlaybackSession> _sessions = new(StringComparer.Ordinal);
+
+    public bool TryGetSource(TrackIdentity identity, out YouTubeMusicPlaybackSession session)
+    {
+        var key = Key(identity);
+        while (_sessions.TryGetValue(key, out var stored))
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (stored.ExpiresAt <= now)
+            {
+                RemoveSession(key, stored);
+                continue;
+            }
+
+            var refreshed = stored with { ExpiresAt = now.Add(SessionTtl) };
+            if (_sessions.TryUpdate(key, refreshed, stored))
+            {
+                session = refreshed;
+                return true;
+            }
+        }
+        session = null!;
+        return false;
+    }
+
+    public bool TryGetLegacy(TrackIdentity identity) =>
+        TryGetSource(identity, out var session) && session.Source == YouTubeMusicPlaybackSource.Legacy;
+
+    public bool TryGetYandex(TrackIdentity identity, out string path)
+    {
+        if (TryGetSource(identity, out var session)
+            && session.Source == YouTubeMusicPlaybackSource.Yandex
+            && session.VideoId is not null)
+        {
+            path = session.VideoId;
+            return true;
+        }
+        path = "";
+        return false;
+    }
+
+    public bool TryGet(TrackIdentity identity, out string videoId, out int itag)
+    {
+        if (TryGetSource(identity, out var session)
+            && session.Source == YouTubeMusicPlaybackSource.YouTubeMusic
+            && session.VideoId is not null && session.Itag is int storedItag)
+        {
+            videoId = session.VideoId;
+            itag = storedItag;
+            return true;
+        }
+        videoId = "";
+        itag = 0;
+        return false;
+    }
+
+    public bool Set(TrackIdentity identity, string videoId, int itag)
+    {
+        PruneExpired();
+        return _sessions.TryAdd(Key(identity), new(YouTubeMusicPlaybackSource.YouTubeMusic, videoId, itag,
+            DateTimeOffset.UtcNow.Add(SessionTtl)));
+    }
+
+    public bool TrySetLegacy(TrackIdentity identity)
+    {
+        PruneExpired();
+        return _sessions.TryAdd(Key(identity), new(YouTubeMusicPlaybackSource.Legacy, null, null,
+            DateTimeOffset.UtcNow.Add(SessionTtl)));
+    }
+
+    public bool TrySetYandex(TrackIdentity identity, string path)
+    {
+        PruneExpired();
+        return _sessions.TryAdd(Key(identity), new(YouTubeMusicPlaybackSource.Yandex, path, null,
+            DateTimeOffset.UtcNow.Add(SessionTtl)));
+    }
+
+    public void Remove(TrackIdentity identity) => _sessions.TryRemove(Key(identity), out _);
+
+    private void PruneExpired()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var pair in _sessions)
+            if (pair.Value.ExpiresAt <= now) RemoveSession(pair.Key, pair.Value);
+    }
+
+    private bool RemoveSession(string key, YouTubeMusicPlaybackSession session) =>
+        ((ICollection<KeyValuePair<string, YouTubeMusicPlaybackSession>>)_sessions)
+            .Remove(new(key, session));
+
+    private static string Key(TrackIdentity identity) =>
+        string.Join("\n", identity.Artist, identity.Title, identity.Album, identity.Duration,
+            identity.Version, identity.IsExplicit);
 }
 
 public interface IYouTubeMusicPlaybackService
@@ -317,14 +434,17 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
     private readonly ILogger<YouTubeMusicPlaybackService> _logger;
     private readonly YouTubeMusicVideoTypeCapture _videoTypes;
     private readonly YouTubeMusicAlbumCapture _albums;
+    private readonly YouTubeMusicPlaybackSessionStore _sessions;
 
     public YouTubeMusicPlaybackService(IHttpClientFactory clients, ILogger<YouTubeMusicPlaybackService> logger,
-        YouTubeMusicVideoTypeCapture videoTypes, YouTubeMusicAlbumCapture albums)
+        YouTubeMusicVideoTypeCapture videoTypes, YouTubeMusicAlbumCapture albums,
+        YouTubeMusicPlaybackSessionStore sessions)
     {
         _clients = clients;
         _logger = logger;
         _videoTypes = videoTypes;
         _albums = albums;
+        _sessions = sessions;
     }
 
     public async Task<YouTubeMusicPlaybackResult> TryOpenStreamAsync(
@@ -333,6 +453,11 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         CancellationToken cancellationToken = default)
     {
         var operationId = Guid.NewGuid().ToString("N");
+        var hasExistingSource = _sessions.TryGetSource(identity, out var existingSource);
+        if (hasExistingSource && existingSource.Source != YouTubeMusicPlaybackSource.YouTubeMusic)
+            return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, ExistingRepresentation = true,
+                Reason = "another source was established concurrently" };
+        var existingRepresentation = hasExistingSource;
         using var videoTypeOperation = _videoTypes.BeginOperation();
         using var albumOperation = _albums.BeginOperation();
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -347,11 +472,11 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
                 httpClient: _clients.CreateClient(ApiClientName));
             var resolved = await ResolveAsync(client, identity, operationId, operationToken);
             if (resolved.Status != YouTubeMusicPlaybackStatus.Matched || resolved.VideoId is null)
-                return new() { Status = resolved.Status, Reason = resolved.Reason };
+                return new() { Status = resolved.Status, ExistingRepresentation = existingRepresentation, Reason = resolved.Reason };
 
             var streaming = await client.GetStreamingDataAsync(resolved.VideoId, operationToken);
             if (streaming.IsLiveContent)
-                return new() { Status = YouTubeMusicPlaybackStatus.NotFound, Reason = "live content is not playable" };
+                return new() { Status = YouTubeMusicPlaybackStatus.NotFound, ExistingRepresentation = existingRepresentation, Reason = "live content is not playable" };
 
             var audio = streaming.StreamInfo
                 .OfType<AudioStreamInfo>()
@@ -360,11 +485,35 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
                 .ThenByDescending(s => s.SampleRate)
                 .ToList();
             if (audio.Count == 0)
-                return new() { Status = YouTubeMusicPlaybackStatus.NotFound, Reason = "no audio-only representation" };
+                return new() { Status = YouTubeMusicPlaybackStatus.NotFound, ExistingRepresentation = existingRepresentation, Reason = "no audio-only representation" };
+
+            var existing = existingRepresentation;
+            if (existing)
+            {
+                var existingVideoId = existingSource.VideoId ?? "";
+                var existingItag = existingSource.Itag ?? 0;
+                if (!string.Equals(existingVideoId, resolved.VideoId, StringComparison.Ordinal))
+                    return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, ExistingRepresentation = true,
+                        Reason = "YouTube Music selected a different video for an established playback session" };
+                var established = audio.FirstOrDefault(s => s.Itag == existingItag);
+                if (established is null)
+                    return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, ExistingRepresentation = true,
+                        Reason = "established YouTube Music representation is unavailable" };
+                audio = [established];
+            }
 
             _logger.LogInformation("YouTube Music selected audio videoId={VideoId} itag={Itag} codec={Codec} container={Container} bitrate={Bitrate}",
                 resolved.VideoId, audio[0].Itag, audio[0].Container.Codecs, audio[0].Container.Format, audio[0].Bitrate);
-            return await OpenCdnAsync(audio[0], rangeHeader, operationToken);
+            var opened = await OpenCdnAsync(audio[0], rangeHeader, operationToken);
+            if (opened.IsMatched && !existing && !_sessions.Set(identity, resolved.VideoId, audio[0].Itag))
+            {
+                await opened.AudioStream!.DisposeAsync();
+                return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, ExistingRepresentation = true,
+                    Reason = "another source was established concurrently" };
+            }
+            if (existing && !opened.IsMatched)
+                return new() { Status = opened.Status, ExistingRepresentation = true, Reason = opened.Reason };
+            return opened;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -373,7 +522,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "YouTube Music playback preparation failed for {Artist} - {Title}", identity.Artist, identity.Title);
-            return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, Reason = ex.Message };
+            return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, ExistingRepresentation = existingRepresentation, Reason = ex.Message };
         }
     }
 
@@ -483,7 +632,9 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
                 }
                 var videoType = _videoTypes.Get(song.Id);
                 var videoReason = YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
-                    albumProvenance: true, videoType);
+                    albumProvenance: true, videoType,
+                    provenanceArtists: rawAlbum.Artists.Concat(album.Artists.Select(a => a.Name)),
+                    expectedVideoId: song.Id);
                 if (videoReason is not null)
                 {
                     _logger.LogInformation(
@@ -557,7 +708,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
             }
             var videoType = _videoTypes.Get(song.Id);
             var videoReason = YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
-                albumProvenance: false, videoType);
+                albumProvenance: false, videoType, expectedVideoId: song.Id);
             if (videoReason is not null)
             {
                 _logger.LogInformation(
@@ -592,6 +743,15 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
     {
         var client = _clients.CreateClient(CdnClientName);
         using var request = new HttpRequestMessage(HttpMethod.Get, stream.Url);
+        var isVisionOs = stream.Url.Contains("c=VISIONOS", StringComparison.OrdinalIgnoreCase);
+        request.Headers.TryAddWithoutValidation("User-Agent", isVisionOs
+            ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+            : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36");
+        if (!isVisionOs)
+        {
+            request.Headers.TryAddWithoutValidation("Origin", "https://music.youtube.com");
+            request.Headers.TryAddWithoutValidation("Referer", "https://music.youtube.com/");
+        }
         if (!string.IsNullOrWhiteSpace(rangeHeader))
             request.Headers.TryAddWithoutValidation("Range", rangeHeader);
 
@@ -690,19 +850,26 @@ internal static class YouTubeMusicTrackMatcher
         => GetVideoInfoRejectionReason(info, identity, albumProvenance, musicVideoType) is null;
 
     internal static string? GetVideoInfoRejectionReason(SongVideoInfo info, TrackIdentity identity,
-        bool albumProvenance, string? musicVideoType)
+        bool albumProvenance, string? musicVideoType,
+        IEnumerable<string?>? provenanceArtists = null, string? expectedVideoId = null)
     {
         if (info.IsLiveContent) return "live content";
         if (info.IsPrivate) return "private video";
         if (info.IsUnlisted) return "unlisted video";
+        if (expectedVideoId is not null && !string.Equals(info.Id, expectedVideoId, StringComparison.Ordinal))
+            return "metadata videoId mismatch";
         var isAtv = string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_ATV", StringComparison.OrdinalIgnoreCase);
         var isOmv = string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_OMV", StringComparison.OrdinalIgnoreCase);
         if (string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_UGC", StringComparison.OrdinalIgnoreCase)) return "UGC video";
         if (musicVideoType == "__CONFLICT__") return "conflicting player/next video type";
         if (!isAtv && !(albumProvenance && isOmv)) return "missing or unsupported music video type";
         if (!albumProvenance && !info.PlayabilityStatus.IsOkay) return "metadata reports unplayable";
-        if (!MatchesTitle(info.Name, identity.Title, identity.Version)) return "metadata title/version mismatch";
-        if (!info.Artists.Any(a => Equal(a.Name, identity.Artist))) return "metadata artist mismatch";
+        if (!MatchesVideoTitle(info.Name, identity.Title, identity.Version, albumProvenance))
+            return "metadata title/version mismatch";
+        var acceptedArtists = provenanceArtists?.Where(a => !string.IsNullOrWhiteSpace(a)).ToArray() ?? [];
+        if (!info.Artists.Any(a => Equal(a.Name, identity.Artist))
+            && (!albumProvenance || !info.Artists.Any(a => acceptedArtists.Any(p => Equal(a.Name, p)))))
+            return "metadata artist mismatch";
         if (!albumProvenance && identity.Album is not null && !Equal(info.Album?.Name, identity.Album)) return "metadata album mismatch";
         if (identity.Duration is int duration && info.Duration > TimeSpan.Zero
             && Math.Abs(info.Duration.TotalSeconds - duration) > Math.Max(10, duration * .05))
@@ -744,6 +911,20 @@ internal static class YouTubeMusicTrackMatcher
         if (Equal(candidate, expected)) return true;
         return !string.IsNullOrWhiteSpace(version)
             && Equal(candidate, $"{expected} {version}");
+    }
+
+    private static bool MatchesVideoTitle(string candidate, string expected, string? version, bool albumProvenance)
+    {
+        if (MatchesTitle(candidate, expected, version)) return true;
+        if (!albumProvenance) return false;
+
+        const string suffix = " (Official Audio)";
+        if (candidate.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)
+            && MatchesTitle(candidate[..^suffix.Length], expected, version)) return true;
+
+        const string bonusSuffix = " - Official Audio)";
+        return candidate.EndsWith(bonusSuffix, StringComparison.OrdinalIgnoreCase)
+            && MatchesTitle(candidate[..^bonusSuffix.Length] + ")", expected, version);
     }
 
     private static bool Equal(string? left, string? right) => Normalize(left) == Normalize(right);

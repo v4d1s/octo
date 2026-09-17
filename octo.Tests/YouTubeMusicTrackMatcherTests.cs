@@ -51,6 +51,77 @@ public sealed class YouTubeMusicTrackMatcherTests
             YouTubeMusicTrackMatcher.GetSongSearchRejectionReason(song, identity));
     }
 
+    [Theory]
+    [InlineData("Song (Official Audio)", "Song")]
+    [InlineData("Song (Bonus - Official Audio)", "Song (Bonus)")]
+    public void AlbumProvenanceAllowsOfficialAudioDecoration(string metadataTitle, string title)
+    {
+        var identity = new TrackIdentity("Future", title, "Album", 180, null, null);
+        var info = new SongVideoInfo(metadataTitle, "video", "browse", "",
+            [new NamedEntity("Metro Boomin", "metro")], null, TimeSpan.FromSeconds(180), null,
+            new PlayabilityStatus(true, null), true, false, false, false, true, false, 0,
+            DateTime.UnixEpoch, DateTime.UnixEpoch, null, [], []);
+
+        Assert.Null(YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
+            albumProvenance: true, "MUSIC_VIDEO_TYPE_OMV", ["Future", "Metro Boomin"], "video"));
+    }
+
+    [Theory]
+    [InlineData("Song (Live) (Official Audio)")]
+    [InlineData("Song (Remix - Official Audio)")]
+    public void AlbumProvenanceStillRejectsRecordingVariants(string metadataTitle)
+    {
+        var identity = new TrackIdentity("Future", "Song", "Album", 180, null, null);
+        var info = new SongVideoInfo(metadataTitle, "video", "browse", "",
+            [new NamedEntity("Future", "future")], null, TimeSpan.FromSeconds(180), null,
+            new PlayabilityStatus(true, null), true, false, false, false, true, false, 0,
+            DateTime.UnixEpoch, DateTime.UnixEpoch, null, [], []);
+
+        Assert.Equal("metadata title/version mismatch",
+            YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
+                albumProvenance: true, "MUSIC_VIDEO_TYPE_OMV", expectedVideoId: "video"));
+    }
+
+    [Fact]
+    public void VideoIdMismatchIsRejectedEvenWithAlbumProvenance()
+    {
+        var identity = new TrackIdentity("Future", "Song", "Album", null, null, null);
+        var info = new SongVideoInfo("Song", "other-video", "browse", "",
+            [new NamedEntity("Future", "future")], null, TimeSpan.Zero, null,
+            new PlayabilityStatus(true, null), true, false, false, false, true, false, 0,
+            DateTime.UnixEpoch, DateTime.UnixEpoch, null, [], []);
+
+        Assert.Equal("metadata videoId mismatch",
+            YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
+                albumProvenance: true, "MUSIC_VIDEO_TYPE_OMV", expectedVideoId: "video"));
+    }
+
+    [Fact]
+    public void PlaybackSessionKeepsSelectedRepresentation()
+    {
+        var identity = new TrackIdentity("Future", "Song", "Album", 180, null, null);
+        var sessions = new YouTubeMusicPlaybackSessionStore();
+
+        Assert.False(sessions.TryGet(identity, out _, out _));
+        Assert.True(sessions.Set(identity, "video", 251));
+        Assert.False(sessions.Set(identity, "other-video", 140));
+        Assert.True(sessions.TryGet(identity, out var videoId, out var itag));
+        Assert.Equal("video", videoId);
+        Assert.Equal(251, itag);
+    }
+
+    [Fact]
+    public void PlaybackSessionDoesNotReplaceEstablishedSource()
+    {
+        var identity = new TrackIdentity("Future", "Song", "Album", 180, null, null);
+        var sessions = new YouTubeMusicPlaybackSessionStore();
+
+        Assert.True(sessions.TrySetLegacy(identity));
+        Assert.False(sessions.TrySetYandex(identity, "song.flac"));
+        Assert.True(sessions.TryGetLegacy(identity));
+        Assert.False(sessions.TryGet(identity, out _, out _));
+    }
+
     [Fact]
     public void ExplicitEditionIsPreferredWhenIdentityIsUnknown()
     {

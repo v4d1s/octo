@@ -132,6 +132,7 @@ builder.Services.AddHttpClient("YandexCdn", c => c.Timeout = Timeout.InfiniteTim
 builder.Services.AddSingleton<YandexPlaybackService>();
 builder.Services.AddSingleton<Octo.Services.Playback.YouTubeMusicVideoTypeCapture>();
 builder.Services.AddSingleton<Octo.Services.Playback.YouTubeMusicAlbumCapture>();
+builder.Services.AddSingleton<Octo.Services.Playback.YouTubeMusicPlaybackSessionStore>();
 builder.Services.AddTransient<Octo.Services.Playback.YouTubeMusicRawResponseHandler>();
 builder.Services.AddHttpClient("YouTubeMusicApi", c => c.Timeout = TimeSpan.FromSeconds(60))
     .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { UseCookies = false, AllowAutoRedirect = false })
