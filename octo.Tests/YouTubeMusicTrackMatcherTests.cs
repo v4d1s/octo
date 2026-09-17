@@ -1,6 +1,7 @@
 using Octo.Services.Playback;
 using YouTubeMusicAPI.Models;
 using YouTubeMusicAPI.Models.Info;
+using YouTubeMusicAPI.Models.Search;
 
 namespace Octo.Tests;
 
@@ -27,6 +28,27 @@ public sealed class YouTubeMusicTrackMatcherTests
         var song = new AlbumSong(title, "video", false, null, TimeSpan.FromSeconds(180), 1);
 
         Assert.False(YouTubeMusicTrackMatcher.MatchesTitleAndDuration(song, identity));
+    }
+
+    [Fact]
+    public void CatalogRejectionExplainsTitleMismatch()
+    {
+        var identity = new TrackIdentity("Artist", "Song", "Album", 180, null, null);
+        var song = new AlbumSong("Song (Live)", "video", false, null, TimeSpan.FromSeconds(180), 1);
+
+        Assert.Equal("title/version mismatch",
+            YouTubeMusicTrackMatcher.GetAlbumTrackRejectionReason(song, identity));
+    }
+
+    [Fact]
+    public void SongSearchRequiresExplicitCandidateWhenRequested()
+    {
+        var identity = new TrackIdentity("Artist", "Song", null, null, null, true);
+        var song = new SongSearchResult("Song", "video",
+            [new NamedEntity("Artist", "artist")], null, TimeSpan.Zero, false, "plays", null, []);
+
+        Assert.Equal("explicit candidate required",
+            YouTubeMusicTrackMatcher.GetSongSearchRejectionReason(song, identity));
     }
 
     [Fact]

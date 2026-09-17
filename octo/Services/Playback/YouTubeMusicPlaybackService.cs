@@ -41,29 +41,48 @@ public interface IYouTubeMusicPlaybackService
 
 public sealed class YouTubeMusicVideoTypeCapture
 {
-    private readonly AsyncLocal<Dictionary<string, string>?> _current = new();
+    private readonly AsyncLocal<Dictionary<string, VideoTypeObservation>?> _current = new();
 
     public IDisposable BeginOperation()
     {
         var previous = _current.Value;
-        _current.Value = new Dictionary<string, string>(StringComparer.Ordinal);
+        _current.Value = new Dictionary<string, VideoTypeObservation>(StringComparer.Ordinal);
         return new OperationScope(() => _current.Value = previous);
     }
 
-    public void Set(string videoId, string? type)
+    public void Set(string videoId, string? type, bool playerResponse)
     {
         if (string.IsNullOrWhiteSpace(videoId) || string.IsNullOrWhiteSpace(type)) return;
         var types = _current.Value;
         if (types is null) return;
-        if (types.TryGetValue(videoId, out var previous)
-            && !string.Equals(previous, type, StringComparison.OrdinalIgnoreCase))
-            types[videoId] = "__CONFLICT__";
-        else
-            types[videoId] = type;
+        types.TryGetValue(videoId, out var previous);
+        previous ??= new();
+        types[videoId] = playerResponse
+            ? previous with { Player = Merge(previous.Player, type) }
+            : previous with { Next = Merge(previous.Next, type) };
     }
 
     public void Reset(string videoId) => _current.Value?.Remove(videoId);
-    public string? Get(string videoId) => _current.Value is { } types && types.TryGetValue(videoId, out var type) ? type : null;
+    public string? Get(string videoId)
+    {
+        if (_current.Value is not { } types || !types.TryGetValue(videoId, out var observation)) return null;
+        if (observation.Player == "__CONFLICT__" || observation.Next == "__CONFLICT__") return "__CONFLICT__";
+        if (observation.Player is not null && observation.Next is not null
+            && !string.Equals(observation.Player, observation.Next, StringComparison.OrdinalIgnoreCase)) return "__CONFLICT__";
+        return observation.Player ?? observation.Next;
+    }
+
+    public string Describe(string videoId) =>
+        _current.Value is { } types && types.TryGetValue(videoId, out var observation)
+            ? $"player={observation.Player ?? "<absent>"}; next={observation.Next ?? "<absent>"}"
+            : "player=<absent>; next=<absent>";
+
+    private static string Merge(string? previous, string current) =>
+        previous is null ? current
+        : string.Equals(previous, current, StringComparison.OrdinalIgnoreCase) ? previous
+        : "__CONFLICT__";
+
+    private sealed record VideoTypeObservation(string? Player = null, string? Next = null);
 
     private sealed class OperationScope(Action onDispose) : IDisposable
     {
@@ -135,10 +154,11 @@ internal sealed class YouTubeMusicRawResponseHandler(
             CaptureAlbums(body, albums);
         if (videoId is not null)
         {
-            var type = request.RequestUri?.AbsolutePath.Contains("player", StringComparison.OrdinalIgnoreCase) == true
+            var playerResponse = request.RequestUri?.AbsolutePath.Contains("player", StringComparison.OrdinalIgnoreCase) == true;
+            var type = playerResponse
                 ? FindString(body, "videoDetails", "musicVideoType")
                 : FindWatchEndpointType(body, videoId);
-            capture.Set(videoId, type);
+            capture.Set(videoId, type, playerResponse);
         }
         return response;
     }
@@ -312,6 +332,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         string? rangeHeader,
         CancellationToken cancellationToken = default)
     {
+        var operationId = Guid.NewGuid().ToString("N");
         using var videoTypeOperation = _videoTypes.BeginOperation();
         using var albumOperation = _albums.BeginOperation();
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -324,7 +345,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
                 cookies: null,
                 poToken: null,
                 httpClient: _clients.CreateClient(ApiClientName));
-            var resolved = await ResolveAsync(client, identity, operationToken);
+            var resolved = await ResolveAsync(client, identity, operationId, operationToken);
             if (resolved.Status != YouTubeMusicPlaybackStatus.Matched || resolved.VideoId is null)
                 return new() { Status = resolved.Status, Reason = resolved.Reason };
 
@@ -341,6 +362,8 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
             if (audio.Count == 0)
                 return new() { Status = YouTubeMusicPlaybackStatus.NotFound, Reason = "no audio-only representation" };
 
+            _logger.LogInformation("YouTube Music selected audio videoId={VideoId} itag={Itag} codec={Codec} container={Container} bitrate={Bitrate}",
+                resolved.VideoId, audio[0].Itag, audio[0].Container.Codecs, audio[0].Container.Format, audio[0].Bitrate);
             return await OpenCdnAsync(audio[0], rangeHeader, operationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -357,16 +380,18 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
     private async Task<Resolution> ResolveAsync(
         YouTubeMusicClient client,
         TrackIdentity identity,
+        string operationId,
         CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(identity.Album))
-            return await ResolveFromAlbumAsync(client, identity, cancellationToken);
-        return await ResolveFromSongSearchAsync(client, identity, cancellationToken);
+            return await ResolveFromAlbumAsync(client, identity, operationId, cancellationToken);
+        return await ResolveFromSongSearchAsync(client, identity, operationId, cancellationToken);
     }
 
     private async Task<Resolution> ResolveFromAlbumAsync(
         YouTubeMusicClient client,
         TrackIdentity identity,
+        string operationId,
         CancellationToken cancellationToken)
     {
         IReadOnlyList<YouTubeMusicAlbumCandidate> rawAlbums;
@@ -390,11 +415,13 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
             return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null, "album browse data was not captured");
 
         var candidates = new List<AlbumTrackCandidate>();
+        var metadataFailures = 0;
         foreach (var rawAlbum in rawAlbums)
         {
             if (!YouTubeMusicTrackMatcher.MatchesAlbum(rawAlbum.Name,
                     rawAlbum.Artists.Select(name => new YouTubeMusicAPI.Models.NamedEntity(name, null)), identity)) continue;
-            _logger.LogInformation("YouTube Music album candidate {Album} ({BrowseId})", rawAlbum.Name, rawAlbum.BrowseId);
+            _logger.LogInformation("YouTube Music album candidate operation={OperationId} {Album} ({BrowseId})",
+                operationId, rawAlbum.Name, rawAlbum.BrowseId);
 
             AlbumInfo album;
             try
@@ -403,32 +430,81 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
             }
             catch (ArgumentNullException)
             {
+                _logger.LogWarning("YouTube Music album metadata parser failed for {BrowseId}", rawAlbum.BrowseId);
                 return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null,
                     "album response could not be parsed");
             }
 
-            if (!YouTubeMusicTrackMatcher.MatchesAlbum(album.Name, album.Artists, identity)
-                || album.IsSingle || album.IsEp || album.Songs.Length != album.SongCount)
+            if (!YouTubeMusicTrackMatcher.MatchesAlbum(album.Name, album.Artists, identity))
+            {
+                _logger.LogInformation("YouTube Music rejected album {Album}: metadata album/artist mismatch", album.Name);
                 continue;
+            }
+            if (album.IsSingle || album.IsEp)
+            {
+                _logger.LogInformation("YouTube Music rejected album {Album}: release is single/EP", album.Name);
+                continue;
+            }
+            if (album.Songs.Length != album.SongCount)
+            {
+                _logger.LogInformation("YouTube Music rejected album {Album}: incomplete tracklist ({Returned}/{Reported})",
+                    album.Name, album.Songs.Length, album.SongCount);
+                continue;
+            }
             // The public model exposes only per-track badges. An all-clean tracklist
             // does not prove that this is a clean edition, so do not guess its edition.
-            if (!album.Songs.Any(s => s.IsExplicit)) continue;
+            if (!album.Songs.Any(s => s.IsExplicit))
+            {
+                _logger.LogInformation("YouTube Music rejected album {Album}: edition explicitness is unknown", album.Name);
+                continue;
+            }
 
-            foreach (var song in album.Songs.Where(s => YouTubeMusicTrackMatcher.MatchesTitleAndDuration(s, identity)))
+            foreach (var song in album.Songs)
             {
                 if (string.IsNullOrWhiteSpace(song.Id)) continue;
+                var catalogReason = YouTubeMusicTrackMatcher.GetAlbumTrackRejectionReason(song, identity);
+                if (catalogReason is not null)
+                {
+                    _logger.LogInformation("YouTube Music rejected catalog track {TrackId} '{Title}': {Reason}",
+                        song.Id, song.Name, catalogReason);
+                    continue;
+                }
                 _videoTypes.Reset(song.Id);
                 SongVideoInfo info;
                 try { info = await client.GetSongVideoInfoAsync(song.Id, cancellationToken); }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                catch { continue; }
-                if (!YouTubeMusicTrackMatcher.MatchesVideoInfo(info, identity, albumProvenance: true,
-                    _videoTypes.Get(song.Id))) continue;
+                catch (Exception ex)
+                {
+                    metadataFailures++;
+                    _logger.LogWarning(ex,
+                        "YouTube Music metadata failed operation={OperationId} for catalog track {TrackId} '{Title}'",
+                        operationId, song.Id, song.Name);
+                    continue;
+                }
+                var videoType = _videoTypes.Get(song.Id);
+                var videoReason = YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
+                    albumProvenance: true, videoType);
+                if (videoReason is not null)
+                {
+                    _logger.LogInformation(
+                        "YouTube Music rejected video operation={OperationId} {VideoId} for catalog track '{Title}': {Reason}; {Types}; " +
+                        "expectedTitle={ExpectedTitle}; expectedVersion={ExpectedVersion}; expectedArtist={ExpectedArtist}; " +
+                        "expectedAlbum={ExpectedAlbum}; metadataTitle={MetadataTitle}; metadataArtists={MetadataArtists}; " +
+                        "metadataAlbum={MetadataAlbum}; metadataVideoId={MetadataVideoId}; live={Live}; private={Private}; unlisted={Unlisted}",
+                        operationId, song.Id, song.Name, videoReason, _videoTypes.Describe(song.Id),
+                        identity.Title, identity.Version, identity.Artist, identity.Album,
+                        info.Name, string.Join(" / ", info.Artists.Select(a => a.Name)), info.Album?.Name, info.Id,
+                        info.IsLiveContent, info.IsPrivate, info.IsUnlisted);
+                    continue;
+                }
                 candidates.Add(new AlbumTrackCandidate(song.Id, album.Songs.Any(s => s.IsExplicit), song.IsExplicit));
             }
         }
 
         var selected = YouTubeMusicTrackMatcher.FilterEditions(candidates, identity.IsExplicit);
+        if (selected.Count == 0 && metadataFailures > 0)
+            return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null,
+                $"metadata lookup failed for {metadataFailures} catalog candidate(s)");
         if (selected.Count == 1)
             _logger.LogInformation("YouTube Music selected album track videoId={VideoId} explicitEdition={Explicit}",
                 selected[0].VideoId, selected[0].ExplicitEdition);
@@ -448,6 +524,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
     private async Task<Resolution> ResolveFromSongSearchAsync(
         YouTubeMusicClient client,
         TrackIdentity identity,
+        string operationId,
         CancellationToken cancellationToken)
     {
         if (identity.IsExplicit == false)
@@ -456,19 +533,50 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         var search = await client.SearchAsync(query, SearchCategory.Songs)
             .FetchItemsAsync(0, 10, cancellationToken);
         var matches = new List<SongSearchCandidate>();
+        var metadataFailures = 0;
         foreach (var song in search.OfType<SongSearchResult>())
         {
-            if (!YouTubeMusicTrackMatcher.MatchesSongSearch(song, identity)) continue;
+            var catalogReason = YouTubeMusicTrackMatcher.GetSongSearchRejectionReason(song, identity);
+            if (catalogReason is not null)
+            {
+                _logger.LogInformation("YouTube Music rejected song candidate {VideoId} '{Title}': {Reason}",
+                    song.Id, song.Name, catalogReason);
+                continue;
+            }
             _videoTypes.Reset(song.Id);
             SongVideoInfo info;
             try { info = await client.GetSongVideoInfoAsync(song.Id, cancellationToken); }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch { continue; }
-            if (YouTubeMusicTrackMatcher.MatchesVideoInfo(info, identity, albumProvenance: false,
-                _videoTypes.Get(song.Id)))
-                matches.Add(new(song.Id, song.IsExplicit));
+            catch (Exception ex)
+            {
+                metadataFailures++;
+                _logger.LogWarning(ex,
+                    "YouTube Music metadata failed operation={OperationId} for song candidate {VideoId} '{Title}'",
+                    operationId, song.Id, song.Name);
+                continue;
+            }
+            var videoType = _videoTypes.Get(song.Id);
+            var videoReason = YouTubeMusicTrackMatcher.GetVideoInfoRejectionReason(info, identity,
+                albumProvenance: false, videoType);
+            if (videoReason is not null)
+            {
+                _logger.LogInformation(
+                    "YouTube Music rejected song video operation={OperationId} {VideoId} '{Title}': {Reason}; {Types}; " +
+                    "expectedTitle={ExpectedTitle}; expectedVersion={ExpectedVersion}; expectedArtist={ExpectedArtist}; " +
+                    "expectedAlbum={ExpectedAlbum}; metadataTitle={MetadataTitle}; metadataArtists={MetadataArtists}; " +
+                    "metadataAlbum={MetadataAlbum}; metadataVideoId={MetadataVideoId}; live={Live}; private={Private}; unlisted={Unlisted}",
+                    operationId, song.Id, song.Name, videoReason, _videoTypes.Describe(song.Id),
+                    identity.Title, identity.Version, identity.Artist, identity.Album,
+                    info.Name, string.Join(" / ", info.Artists.Select(a => a.Name)), info.Album?.Name, info.Id,
+                    info.IsLiveContent, info.IsPrivate, info.IsUnlisted);
+                continue;
+            }
+            matches.Add(new(song.Id, song.IsExplicit));
         }
         var selected = YouTubeMusicTrackMatcher.FilterEditions(matches, identity.IsExplicit);
+        if (selected.Count == 0 && metadataFailures > 0)
+            return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null,
+                $"metadata lookup failed for {metadataFailures} song candidate(s)");
         return selected.Count switch
         {
             0 => new(YouTubeMusicPlaybackStatus.NotFound, null, "song search found no confident match"),
@@ -492,6 +600,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headerTimeout.Token);
         if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
         {
+            _logger.LogWarning("YouTube Music CDN returned HTTP {StatusCode} for selected stream", (int)response.StatusCode);
             response.Dispose();
             return new() { Status = YouTubeMusicPlaybackStatus.TemporaryFailure, Reason = $"CDN returned {(int)response.StatusCode}" };
         }
@@ -552,27 +661,53 @@ internal static class YouTubeMusicTrackMatcher
     }
 
     internal static bool MatchesSongSearch(SongSearchResult song, TrackIdentity identity) =>
-        MatchesTitle(song.Name, identity.Title, identity.Version)
-        && song.Artists.Any(a => Equal(a.Name, identity.Artist))
-        && (identity.Duration is not int duration || song.Duration <= TimeSpan.Zero
-            || Math.Abs(song.Duration.TotalSeconds - duration) <= Math.Max(10, duration * .05))
-        && (identity.Album is null || Equal(song.Album?.Name, identity.Album));
+        GetSongSearchRejectionReason(song, identity) is null;
+
+    internal static string? GetAlbumTrackRejectionReason(AlbumSong song, TrackIdentity identity)
+    {
+        if (!MatchesTitle(song.Name, identity.Title, identity.Version)) return "title/version mismatch";
+        if (identity.Duration is int duration && song.Duration > TimeSpan.Zero
+            && Math.Abs(song.Duration.TotalSeconds - duration) > Math.Max(10, duration * .05))
+            return $"duration mismatch (catalog={song.Duration.TotalSeconds:0.##}s, expected={duration}s)";
+        return null;
+    }
+
+    internal static string? GetSongSearchRejectionReason(SongSearchResult song, TrackIdentity identity)
+    {
+        if (!MatchesTitle(song.Name, identity.Title, identity.Version)) return "title/version mismatch";
+        if (!song.Artists.Any(a => Equal(a.Name, identity.Artist))) return "artist mismatch";
+        if (identity.Duration is int duration && song.Duration > TimeSpan.Zero
+            && Math.Abs(song.Duration.TotalSeconds - duration) > Math.Max(10, duration * .05))
+            return $"duration mismatch (catalog={song.Duration.TotalSeconds:0.##}s, expected={duration}s)";
+        if (identity.Album is not null && !Equal(song.Album?.Name, identity.Album)) return "album mismatch";
+        if (identity.IsExplicit == true && !song.IsExplicit) return "explicit candidate required";
+        if (identity.IsExplicit == false && song.IsExplicit) return "clean candidate required";
+        return null;
+    }
 
     internal static bool MatchesVideoInfo(SongVideoInfo info, TrackIdentity identity, bool albumProvenance,
         string? musicVideoType = null)
+        => GetVideoInfoRejectionReason(info, identity, albumProvenance, musicVideoType) is null;
+
+    internal static string? GetVideoInfoRejectionReason(SongVideoInfo info, TrackIdentity identity,
+        bool albumProvenance, string? musicVideoType)
     {
-        if (info.IsLiveContent || info.IsPrivate || info.IsUnlisted) return false;
+        if (info.IsLiveContent) return "live content";
+        if (info.IsPrivate) return "private video";
+        if (info.IsUnlisted) return "unlisted video";
         var isAtv = string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_ATV", StringComparison.OrdinalIgnoreCase);
         var isOmv = string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_OMV", StringComparison.OrdinalIgnoreCase);
-        if (!isAtv && !(albumProvenance && isOmv))
-            return false;
-        if (!albumProvenance && !info.PlayabilityStatus.IsOkay) return false;
-        if (!MatchesTitle(info.Name, identity.Title, identity.Version)) return false;
-        if (!info.Artists.Any(a => Equal(a.Name, identity.Artist))) return false;
-        if (!albumProvenance && identity.Album is not null && !Equal(info.Album?.Name, identity.Album)) return false;
+        if (string.Equals(musicVideoType, "MUSIC_VIDEO_TYPE_UGC", StringComparison.OrdinalIgnoreCase)) return "UGC video";
+        if (musicVideoType == "__CONFLICT__") return "conflicting player/next video type";
+        if (!isAtv && !(albumProvenance && isOmv)) return "missing or unsupported music video type";
+        if (!albumProvenance && !info.PlayabilityStatus.IsOkay) return "metadata reports unplayable";
+        if (!MatchesTitle(info.Name, identity.Title, identity.Version)) return "metadata title/version mismatch";
+        if (!info.Artists.Any(a => Equal(a.Name, identity.Artist))) return "metadata artist mismatch";
+        if (!albumProvenance && identity.Album is not null && !Equal(info.Album?.Name, identity.Album)) return "metadata album mismatch";
         if (identity.Duration is int duration && info.Duration > TimeSpan.Zero
-            && Math.Abs(info.Duration.TotalSeconds - duration) > Math.Max(10, duration * .05)) return false;
-        return true;
+            && Math.Abs(info.Duration.TotalSeconds - duration) > Math.Max(10, duration * .05))
+            return $"metadata duration mismatch (metadata={info.Duration.TotalSeconds:0.##}s, expected={duration}s)";
+        return null;
     }
 
     internal static T? SelectEdition<T>(IEnumerable<T> candidates, bool? requestedExplicit)
