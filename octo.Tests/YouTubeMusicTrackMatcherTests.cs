@@ -69,6 +69,57 @@ public sealed class YouTubeMusicTrackMatcherTests
         Assert.Empty(YouTubeMusicTrackMatcher.FilterEditions(candidates, null));
     }
 
+    [Fact]
+    public void PremiumUpsellParserFailureIsRecognizedByParameterPath()
+    {
+        var exception = new ArgumentNullException(
+            "overlay.musicItemThumbnailOverlayRenderer.content.musicPlayButtonRenderer.playNavigationEndpoint.watchEndpoint.playlistId");
+
+        Assert.True(YouTubeMusicPlaybackService.IsPremiumUpsellParserFailure(exception));
+    }
+
+    [Fact]
+    public void UnrelatedParserFailureIsNotRecognizedAsPremiumUpsell()
+    {
+        var exception = new ArgumentNullException("album.title");
+
+        Assert.False(YouTubeMusicPlaybackService.IsPremiumUpsellParserFailure(exception));
+    }
+
+    [Fact]
+    public async Task RawAlbumSearchCapturesBrowseIdWithoutPlaylistRedirect()
+    {
+        var albums = new YouTubeMusicAlbumCapture();
+        using var operation = albums.BeginOperation();
+        var videos = new YouTubeMusicVideoTypeCapture();
+        using var handler = new YouTubeMusicRawResponseHandler(videos, albums)
+        {
+            InnerHandler = new FixedResponseHandler("""
+                {"contents":[{"musicResponsiveListItemRenderer":{"navigationEndpoint":{"browseEndpoint":{"browseId":"MPREabc","browseEndpointContextSupportedConfigs":{"browseEndpointContextMusicConfig":{"pageType":"MUSIC_PAGE_TYPE_ALBUM"}}}},"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"We Don't Trust You"}]}}},{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Album"},{"text":"Future","navigationEndpoint":{"browseEndpoint":{"browseId":"UCfuture"}}}]}}}]}}]}
+                """)
+        };
+        using var client = new HttpClient(handler);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://music.youtube.com/youtubei/v1/search")
+        {
+            Content = new StringContent("{}")
+        };
+
+        using var response = await client.SendAsync(request);
+
+        var album = Assert.Single(albums.Get());
+        Assert.Equal("MPREabc", album.BrowseId);
+        Assert.Equal("We Don't Trust You", album.Name);
+    }
+
+    private sealed class FixedResponseHandler(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json")
+            });
+    }
+
     private sealed record EditionCandidate(string Id, bool ExplicitEdition)
         : YouTubeMusicTrackMatcher.IYouTubeMusicEditionCandidate;
 }

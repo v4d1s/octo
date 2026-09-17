@@ -71,7 +71,40 @@ public sealed class YouTubeMusicVideoTypeCapture
     }
 }
 
-internal sealed class YouTubeMusicRawResponseHandler(YouTubeMusicVideoTypeCapture capture) : DelegatingHandler
+public sealed record YouTubeMusicAlbumCandidate(
+    string Name,
+    IReadOnlyList<string> Artists,
+    string BrowseId);
+
+public sealed class YouTubeMusicAlbumCapture
+{
+    private readonly AsyncLocal<List<YouTubeMusicAlbumCandidate>?> _current = new();
+
+    public IDisposable BeginOperation()
+    {
+        var previous = _current.Value;
+        _current.Value = new List<YouTubeMusicAlbumCandidate>();
+        return new OperationScope(() => _current.Value = previous);
+    }
+
+    public void Add(YouTubeMusicAlbumCandidate candidate)
+    {
+        var albums = _current.Value;
+        if (albums is null || albums.Any(a => string.Equals(a.BrowseId, candidate.BrowseId, StringComparison.Ordinal))) return;
+        albums.Add(candidate);
+    }
+
+    public IReadOnlyList<YouTubeMusicAlbumCandidate> Get() => _current.Value ?? [];
+
+    private sealed class OperationScope(Action onDispose) : IDisposable
+    {
+        public void Dispose() => onDispose();
+    }
+}
+
+internal sealed class YouTubeMusicRawResponseHandler(
+    YouTubeMusicVideoTypeCapture capture,
+    YouTubeMusicAlbumCapture albums) : DelegatingHandler
 {
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -88,7 +121,7 @@ internal sealed class YouTubeMusicRawResponseHandler(YouTubeMusicVideoTypeCaptur
         }
 
         var response = await base.SendAsync(request, cancellationToken);
-        if (videoId is null || response.Content is null) return response;
+        if (response.Content is null) return response;
 
         var body = await response.Content.ReadAsByteArrayAsync(cancellationToken);
         var oldContent = response.Content;
@@ -98,11 +131,74 @@ internal sealed class YouTubeMusicRawResponseHandler(YouTubeMusicVideoTypeCaptur
         oldContent.Dispose();
         response.Content = replacementBody;
 
-        var type = request.RequestUri?.AbsolutePath.Contains("player", StringComparison.OrdinalIgnoreCase) == true
-            ? FindString(body, "videoDetails", "musicVideoType")
-            : FindWatchEndpointType(body, videoId);
-        capture.Set(videoId, type);
+        if (request.RequestUri?.AbsolutePath.Contains("search", StringComparison.OrdinalIgnoreCase) == true)
+            CaptureAlbums(body, albums);
+        if (videoId is not null)
+        {
+            var type = request.RequestUri?.AbsolutePath.Contains("player", StringComparison.OrdinalIgnoreCase) == true
+                ? FindString(body, "videoDetails", "musicVideoType")
+                : FindWatchEndpointType(body, videoId);
+            capture.Set(videoId, type);
+        }
         return response;
+    }
+
+    private static void CaptureAlbums(byte[] body, YouTubeMusicAlbumCapture albums)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            CaptureAlbums(document.RootElement, albums);
+        }
+        catch (JsonException) { }
+    }
+
+    private static void CaptureAlbums(JsonElement element, YouTubeMusicAlbumCapture albums)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            if (element.TryGetProperty("musicResponsiveListItemRenderer", out var row))
+                TryCaptureAlbum(row, albums);
+            foreach (var property in element.EnumerateObject())
+                CaptureAlbums(property.Value, albums);
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                CaptureAlbums(item, albums);
+        }
+    }
+
+    private static void TryCaptureAlbum(JsonElement row, YouTubeMusicAlbumCapture albums)
+    {
+        if (!row.TryGetProperty("navigationEndpoint", out var navigation)
+            || !navigation.TryGetProperty("browseEndpoint", out var browse)
+            || !browse.TryGetProperty("browseId", out var browseId)
+            || browseId.ValueKind != JsonValueKind.String
+            || !browseId.GetString()!.StartsWith("MPRE", StringComparison.Ordinal)) return;
+        if (!browse.TryGetProperty("browseEndpointContextSupportedConfigs", out var configs)
+            || !configs.TryGetProperty("browseEndpointContextMusicConfig", out var musicConfig)
+            || !musicConfig.TryGetProperty("pageType", out var pageType)
+            || pageType.GetString() != "MUSIC_PAGE_TYPE_ALBUM") return;
+        if (!row.TryGetProperty("flexColumns", out var columns)
+            || columns.ValueKind != JsonValueKind.Array || columns.GetArrayLength() < 2) return;
+        var name = FindString(columns[0], "musicResponsiveListItemFlexColumnRenderer", "text", "runs", "0", "text");
+        if (string.IsNullOrWhiteSpace(name)) return;
+        var artists = new List<string>();
+        var runs = columns[1].TryGetProperty("musicResponsiveListItemFlexColumnRenderer", out var flex)
+            && flex.TryGetProperty("text", out var text)
+            && text.TryGetProperty("runs", out var runArray)
+            ? runArray : default;
+        if (runs.ValueKind == JsonValueKind.Array)
+            foreach (var run in runs.EnumerateArray())
+            {
+                var artistId = FindString(run, "navigationEndpoint", "browseEndpoint", "browseId");
+                var artist = run.TryGetProperty("text", out var artistText) ? artistText.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(artist) && artistId?.StartsWith("UC", StringComparison.Ordinal) == true)
+                    artists.Add(artist);
+            }
+        if (artists.Count > 0)
+            albums.Add(new(name!, artists, browseId.GetString()!));
     }
 
     private static string? TryFindVideoId(byte[] body)
@@ -130,7 +226,17 @@ internal sealed class YouTubeMusicRawResponseHandler(YouTubeMusicVideoTypeCaptur
         var current = element;
         foreach (var part in path)
         {
-            if (!current.TryGetProperty(part, out current)) return null;
+            if (current.ValueKind == JsonValueKind.Object)
+            {
+                if (!current.TryGetProperty(part, out current)) return null;
+            }
+            else if (current.ValueKind == JsonValueKind.Array
+                && int.TryParse(part, out var index)
+                && index >= 0 && index < current.GetArrayLength())
+            {
+                current = current[index];
+            }
+            else return null;
         }
         return current.ValueKind == JsonValueKind.String ? current.GetString() : null;
     }
@@ -190,13 +296,15 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
     private readonly IHttpClientFactory _clients;
     private readonly ILogger<YouTubeMusicPlaybackService> _logger;
     private readonly YouTubeMusicVideoTypeCapture _videoTypes;
+    private readonly YouTubeMusicAlbumCapture _albums;
 
     public YouTubeMusicPlaybackService(IHttpClientFactory clients, ILogger<YouTubeMusicPlaybackService> logger,
-        YouTubeMusicVideoTypeCapture videoTypes)
+        YouTubeMusicVideoTypeCapture videoTypes, YouTubeMusicAlbumCapture albums)
     {
         _clients = clients;
         _logger = logger;
         _videoTypes = videoTypes;
+        _albums = albums;
     }
 
     public async Task<YouTubeMusicPlaybackResult> TryOpenStreamAsync(
@@ -205,6 +313,7 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         CancellationToken cancellationToken = default)
     {
         using var videoTypeOperation = _videoTypes.BeginOperation();
+        using var albumOperation = _albums.BeginOperation();
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(TimeSpan.FromSeconds(90));
         var operationToken = deadline.Token;
@@ -260,27 +369,37 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         TrackIdentity identity,
         CancellationToken cancellationToken)
     {
-        IReadOnlyList<SearchResult> search;
+        IReadOnlyList<YouTubeMusicAlbumCandidate> rawAlbums;
         try
         {
-            search = await client.SearchAsync(identity.Album!, SearchCategory.Albums)
+            _ = await client.SearchAsync(identity.Album!, SearchCategory.Albums)
                 .FetchItemsAsync(0, 20, cancellationToken);
+            rawAlbums = _albums.Get();
         }
-        catch (ArgumentNullException)
+        catch (ArgumentNullException ex) when (IsPremiumUpsellParserFailure(ex))
         {
-            return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null, "album search response could not be parsed");
+            // The library's premium-upsell search parser can fail after the raw
+            // response has already been captured. Continue only with those
+            // catalog entities; an unrelated parser failure still falls back.
+            rawAlbums = _albums.Get();
+            if (rawAlbums.Count == 0)
+                return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null,
+                    "album search response could not be parsed");
         }
+        if (rawAlbums.Count == 0)
+            return new(YouTubeMusicPlaybackStatus.TemporaryFailure, null, "album browse data was not captured");
+
         var candidates = new List<AlbumTrackCandidate>();
-        foreach (var result in search.OfType<AlbumSearchResult>())
+        foreach (var rawAlbum in rawAlbums)
         {
-            if (!YouTubeMusicTrackMatcher.MatchesAlbum(result.Name, result.Artists, identity)) continue;
-            if (result.IsSingle || result.IsEp) continue;
+            if (!YouTubeMusicTrackMatcher.MatchesAlbum(rawAlbum.Name,
+                    rawAlbum.Artists.Select(name => new YouTubeMusicAPI.Models.NamedEntity(name, null)), identity)) continue;
+            _logger.LogInformation("YouTube Music album candidate {Album} ({BrowseId})", rawAlbum.Name, rawAlbum.BrowseId);
 
             AlbumInfo album;
             try
             {
-                var browseId = await client.GetAlbumBrowseIdAsync(result.Id, cancellationToken);
-                album = await client.GetAlbumInfoAsync(browseId, cancellationToken);
+                album = await client.GetAlbumInfoAsync(rawAlbum.BrowseId, cancellationToken);
             }
             catch (ArgumentNullException)
             {
@@ -310,6 +429,9 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
         }
 
         var selected = YouTubeMusicTrackMatcher.FilterEditions(candidates, identity.IsExplicit);
+        if (selected.Count == 1)
+            _logger.LogInformation("YouTube Music selected album track videoId={VideoId} explicitEdition={Explicit}",
+                selected[0].VideoId, selected[0].ExplicitEdition);
         return selected.Count switch
         {
             0 => new(YouTubeMusicPlaybackStatus.NotFound, null, "no exact track in a matching album edition"),
@@ -317,6 +439,11 @@ public sealed class YouTubeMusicPlaybackService : IYouTubeMusicPlaybackService
             _ => new(YouTubeMusicPlaybackStatus.Ambiguous, null, $"{selected.Count} album editions matched"),
         };
     }
+
+    internal static bool IsPremiumUpsellParserFailure(ArgumentNullException exception) =>
+        exception.ParamName?.StartsWith(
+            "overlay.musicItemThumbnailOverlayRenderer.",
+            StringComparison.Ordinal) == true;
 
     private async Task<Resolution> ResolveFromSongSearchAsync(
         YouTubeMusicClient client,
