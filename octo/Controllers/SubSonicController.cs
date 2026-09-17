@@ -16,6 +16,8 @@ using Octo.Services.Local;
 using Octo.Services.Subsonic;
 using Octo.Services.LastFm;
 using Octo.Services.CoverArt;
+using Octo.Services.Playback;
+using Octo.Services.Yandex;
 using Octo.Services.Soulseek;
 
 namespace Octo.Controllers;
@@ -57,6 +59,7 @@ public class SubsonicController : ControllerBase
     private readonly LastFmRadioRefreshQueue? _radioRefreshQueue;
     private readonly LastFmRadioStreamSessionStore _radioStreamSessions;
     private readonly LastFmRadioStreamService _radioStreams;
+    private readonly YandexPlaybackService _yandexPlayback;
 
     public SubsonicController(
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
@@ -78,6 +81,7 @@ public class SubsonicController : ControllerBase
         IOptionsMonitor<LastFmSettings> lastFmSettings,
         LastFmRadioStreamSessionStore radioStreamSessions,
         LastFmRadioStreamService radioStreams,
+        YandexPlaybackService yandexPlayback,
         PlaylistSyncService? playlistSyncService = null,
         LastFmService? lastFmService = null,
         CoverArtService? coverArtService = null,
@@ -112,6 +116,7 @@ public class SubsonicController : ControllerBase
         _radioRefreshQueue = radioRefreshQueue;
         _radioStreamSessions = radioStreamSessions;
         _radioStreams = radioStreams;
+        _yandexPlayback = yandexPlayback;
         // No hard throw on a missing/blank Subsonic URL: that made every request
         // fail opaquely. Misconfiguration is now reported per-request with an
         // actionable message (see Ping and OctoNotConfiguredException), and the
@@ -1081,6 +1086,38 @@ public class SubsonicController : ControllerBase
                     triggerAlbumDownload: false, forcePermanent: true);
                 return await ServeAcquiredAsync(acquisition, provider!, externalId!, id, format,
                     allowPreviewFallback: true);
+            }
+
+            Song? song = null;
+            try
+            {
+                song = await _metadataService.GetSongAsync(provider!, externalId!);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogInformation(ex, "Could not build Yandex playback identity for {Id}; using legacy playback", id);
+            }
+            if (song is not null)
+            {
+                var identity = new TrackIdentity(song.Artist, song.Title, string.IsNullOrWhiteSpace(song.Album) ? null : song.Album,
+                    song.Duration is > 0 and < 86400 && song.ExternalProvider is not "soulseek" ? song.Duration : null,
+                    null,
+                    song.ExplicitContentLyrics switch { 1 => true, 3 => false, _ => null });
+                var yandex = await _yandexPlayback.TryPrepareAsync(identity, HttpContext.RequestAborted);
+                if (yandex.IsMatched)
+                {
+                    try
+                    {
+                        var stream = System.IO.File.OpenRead(yandex.Path!);
+                        _logger.LogInformation("Yandex playback selected for {Id}", id);
+                        return File(stream, yandex.ContentType!, enableRangeProcessing: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogInformation(ex, "Yandex playback file was unavailable for {Id}; using legacy playback", id);
+                    }
+                }
+                _logger.LogInformation("Yandex playback fallback for {Id}: {Status} ({Reason})", id, yandex.Status, yandex.Reason);
             }
 
             var direct = await TryDirectStreamAsync(provider!, externalId!, id);

@@ -42,6 +42,13 @@ services:
       # ----- yt-dlp shim sidecar (internal stream-preview source) -----
       YouTube__ShimUrl: http://yt-dlp-shim:8080
 
+      # ----- optional Yandex playback source -----
+      Yandex__Enabled: ${YANDEX_ENABLED:-false}
+      Yandex__OAuthToken: ${YANDEX_OAUTH_TOKEN:-}
+      Yandex__PlaybackTimeoutSeconds: ${YANDEX_PLAYBACK_TIMEOUT_SECONDS:-20}
+      Yandex__TemporaryPlaybackDirectory: ${YANDEX_TEMPORARY_PLAYBACK_DIRECTORY:-}
+      Yandex__TemporaryFileTtlHours: ${YANDEX_TEMPORARY_FILE_TTL_HOURS:-6}
+
       # ----- slskd (Soulseek) sidecar -----
       Soulseek__BaseUrl: http://slskd:5030
       Soulseek__Username: ${SLSKD_USERNAME:-slskd}

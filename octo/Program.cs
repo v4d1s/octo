@@ -9,6 +9,7 @@ using Octo.Services.Subsonic;
 using Octo.Services.Common;
 using Octo.Services.LastFm;
 using Octo.Services.Lidarr;
+using Octo.Services.Yandex;
 using Octo.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -71,6 +72,8 @@ builder.Services.Configure<ServerSettings>(
     builder.Configuration.GetSection("Server"));
 builder.Services.Configure<ListenBrainzSettings>(
     builder.Configuration.GetSection("ListenBrainz"));
+builder.Services.Configure<YandexSettings>(
+    builder.Configuration.GetSection("Yandex"));
 // Listens are records of plays that already happened; a slow ListenBrainz must not
 // hold a scrobble response or a radio stream, so the client is short-fused.
 builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzService.ClientName,
@@ -119,6 +122,14 @@ builder.Services.AddHttpClient(YouTubeResolver.StreamClientName, c =>
 {
     c.Timeout = Timeout.InfiniteTimeSpan;
 });
+builder.Services.AddHttpClient("YandexApi", c =>
+{
+    c.BaseAddress = new Uri("https://api.music.yandex.net");
+    c.Timeout = Timeout.InfiniteTimeSpan;
+    c.DefaultRequestHeaders.Add("X-Yandex-Music-Client", "YandexMusicDesktopAppWindows/5.13.2");
+});
+builder.Services.AddHttpClient("YandexCdn", c => c.Timeout = Timeout.InfiniteTimeSpan);
+builder.Services.AddSingleton<YandexPlaybackService>();
 builder.Services.AddSingleton(sp => new ExternalIdRegistry(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "external-ids.json"),
     sp.GetRequiredService<ILogger<ExternalIdRegistry>>()));
