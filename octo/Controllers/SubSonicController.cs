@@ -60,6 +60,7 @@ public class SubsonicController : ControllerBase
     private readonly LastFmRadioStreamSessionStore _radioStreamSessions;
     private readonly LastFmRadioStreamService _radioStreams;
     private readonly YandexPlaybackService _yandexPlayback;
+    private readonly IYouTubeMusicPlaybackService _youtubeMusicPlayback;
 
     public SubsonicController(
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
@@ -82,6 +83,7 @@ public class SubsonicController : ControllerBase
         LastFmRadioStreamSessionStore radioStreamSessions,
         LastFmRadioStreamService radioStreams,
         YandexPlaybackService yandexPlayback,
+        IYouTubeMusicPlaybackService youtubeMusicPlayback,
         PlaylistSyncService? playlistSyncService = null,
         LastFmService? lastFmService = null,
         CoverArtService? coverArtService = null,
@@ -117,6 +119,7 @@ public class SubsonicController : ControllerBase
         _radioStreamSessions = radioStreamSessions;
         _radioStreams = radioStreams;
         _yandexPlayback = yandexPlayback;
+        _youtubeMusicPlayback = youtubeMusicPlayback;
         // No hard throw on a missing/blank Subsonic URL: that made every request
         // fail opaquely. Misconfiguration is now reported per-request with an
         // actionable message (see Ping and OctoNotConfiguredException), and the
@@ -1118,6 +1121,27 @@ public class SubsonicController : ControllerBase
                     }
                 }
                 _logger.LogInformation("Yandex playback fallback for {Id}: {Status} ({Reason})", id, yandex.Status, yandex.Reason);
+
+                var youtubeMusic = await _youtubeMusicPlayback.TryOpenStreamAsync(identity,
+                    Request.Headers.TryGetValue("Range", out var ytRange) ? ytRange.ToString() : null,
+                    HttpContext.RequestAborted);
+                if (youtubeMusic.IsMatched)
+                {
+                    Response.StatusCode = youtubeMusic.StatusCode;
+                    Response.Headers["Content-Type"] = youtubeMusic.ContentType ?? "audio/mp4";
+                    Response.Headers["Accept-Ranges"] = "bytes";
+                    if (youtubeMusic.ContentLength.HasValue)
+                        Response.Headers["Content-Length"] = youtubeMusic.ContentLength.Value.ToString();
+                    if (!string.IsNullOrWhiteSpace(youtubeMusic.ContentRange))
+                        Response.Headers["Content-Range"] = youtubeMusic.ContentRange;
+                    await using (youtubeMusic.AudioStream!)
+                    {
+                        await youtubeMusic.AudioStream.CopyToAsync(Response.Body, HttpContext.RequestAborted);
+                    }
+                    return new EmptyResult();
+                }
+                _logger.LogInformation("YouTube Music fallback for {Id}: {Status} ({Reason})",
+                    id, youtubeMusic.Status, youtubeMusic.Reason);
             }
 
             var direct = await TryDirectStreamAsync(provider!, externalId!, id);

@@ -35,6 +35,7 @@
         <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.7" />
         <PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.4" />
         <PackageReference Include="TagLibSharp" Version="2.3.0" />
+        <PackageReference Include="YouTubeMusicAPI" Version="[3.0.11]" />
     </ItemGroup>
 
 </Project>

@@ -9,6 +9,7 @@ using Octo.Models.Settings;
 using Octo.Services;
 using Octo.Services.Common;
 using Octo.Services.Local;
+using Octo.Services.Playback;
 
 namespace Octo.Tests;
 
@@ -86,10 +87,48 @@ public sealed class ExternalPlaybackTests
         }
     }
 
+    [Fact]
+    public async Task YouTubeMusicSuccessSkipsLegacyDirectStream()
+    {
+        var downloads = new Mock<IDownloadService>();
+        var library = new Mock<ILocalLibraryService>();
+        var metadata = new Mock<IMusicMetadataService>();
+        var youtubeMusic = new Mock<IYouTubeMusicPlaybackService>();
+        library.Setup(service => service.ParseSongId("external-track"))
+            .Returns((true, "soulseek", "track-id"));
+        metadata.Setup(service => service.GetSongAsync("soulseek", "track-id"))
+            .ReturnsAsync(new Octo.Models.Domain.Song
+            {
+                Artist = "Artist", Title = "Song", Album = "Album", Duration = 180,
+                ExternalProvider = "deezer", ExplicitContentLyrics = null,
+            });
+        youtubeMusic.Setup(service => service.TryOpenStreamAsync(
+                It.IsAny<TrackIdentity>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new YouTubeMusicPlaybackResult
+            {
+                Status = YouTubeMusicPlaybackStatus.Matched,
+                AudioStream = new MemoryStream([7, 8, 9]),
+                ContentType = "audio/webm",
+                ContentLength = 3,
+            });
+
+        await using var factory = CreateFactory(downloads, library, waitForLossless: false,
+            metadata: metadata, youtubeMusic: youtubeMusic);
+        using var client = factory.CreateClient();
+        using var response = await client.GetAsync("/rest/stream?id=external-track&f=json");
+
+        response.EnsureSuccessStatusCode();
+        Assert.Equal([7, 8, 9], await response.Content.ReadAsByteArrayAsync());
+        downloads.Verify(service => service.GetDirectStreamAsync(
+            It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     private static WebApplicationFactory<Program> CreateFactory(
         Mock<IDownloadService> downloads,
         Mock<ILocalLibraryService> library,
-        bool waitForLossless)
+        bool waitForLossless,
+        Mock<IMusicMetadataService>? metadata = null,
+        Mock<IYouTubeMusicPlaybackService>? youtubeMusic = null)
     {
         return new WebApplicationFactory<Program>()
             .WithWebHostBuilder(builder =>
@@ -108,6 +147,16 @@ public sealed class ExternalPlaybackTests
                     services.RemoveAll<IHostedService>();
                     services.RemoveAll<IDownloadService>();
                     services.RemoveAll<ILocalLibraryService>();
+                    if (metadata is not null)
+                    {
+                        services.RemoveAll<IMusicMetadataService>();
+                        services.AddSingleton(metadata.Object);
+                    }
+                    if (youtubeMusic is not null)
+                    {
+                        services.RemoveAll<IYouTubeMusicPlaybackService>();
+                        services.AddSingleton(youtubeMusic.Object);
+                    }
                     services.AddSingleton(downloads.Object);
                     services.AddSingleton(library.Object);
                 });

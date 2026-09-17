@@ -130,6 +130,15 @@ builder.Services.AddHttpClient("YandexApi", c =>
 });
 builder.Services.AddHttpClient("YandexCdn", c => c.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddSingleton<YandexPlaybackService>();
+builder.Services.AddSingleton<Octo.Services.Playback.YouTubeMusicVideoTypeCapture>();
+builder.Services.AddTransient<Octo.Services.Playback.YouTubeMusicRawResponseHandler>();
+builder.Services.AddHttpClient("YouTubeMusicApi", c => c.Timeout = TimeSpan.FromSeconds(60))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { UseCookies = false, AllowAutoRedirect = false })
+    .AddHttpMessageHandler(() => new Octo.Services.Playback.AnonymousCookieStripHandler())
+    .AddHttpMessageHandler<Octo.Services.Playback.YouTubeMusicRawResponseHandler>();
+builder.Services.AddHttpClient("YouTubeMusicCdn", c => c.Timeout = Timeout.InfiniteTimeSpan);
+builder.Services.AddSingleton<Octo.Services.Playback.IYouTubeMusicPlaybackService,
+    Octo.Services.Playback.YouTubeMusicPlaybackService>();
 builder.Services.AddSingleton(sp => new ExternalIdRegistry(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "external-ids.json"),
     sp.GetRequiredService<ILogger<ExternalIdRegistry>>()));
